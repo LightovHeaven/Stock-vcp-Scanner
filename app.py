@@ -1,453 +1,509 @@
 """
-================================================================================
-MINERVINI & LIVERMORE QUANT TERMINAL (LIGHTWEIGHT EDITION)
-- Ngôn ngữ: Python (Streamlit, Pandas, Requests, SQLite3)
-- Nguồn dữ liệu: TCBS Direct REST API (Không cần Token / API Key)
-- Thiết kế: Tối giản phụ thuộc, chống crash 100% trên môi trường Cloud
-================================================================================
+Ứng dụng Web: Realtime Vietnam Stock Screener (Minervini SEPA + Livermore Pivot)
+Tác giả: Senior Software Engineer & Pro Trader
+Công nghệ: Python 3.10+, Streamlit, Plotly, Pandas, TCBS Public API
 """
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import requests
-import sqlite3
-import datetime
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
-from typing import Optional, Dict, Any, Tuple
+import io
 
 # ==============================================================================
-# 1. CẤU HÌNH GIAO DIỆN HỆ THỐNG
+# CẤU HÌNH TRANG STREAMLIT
 # ==============================================================================
 st.set_page_config(
-    page_title="Minervini Quant Terminal",
-    page_icon="⚡",
+    page_title="VN-Stock Screener (SEPA & Pivot)",
+    page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
+# Header và phong cách giao diện
+st.markdown("""
+    <style>
+    .main-title {
+        font-size: 28px;
+        font-weight: 800;
+        color: #1E88E5;
+        margin-bottom: 0px;
+    }
+    .sub-title {
+        font-size: 15px;
+        color: #616161;
+        margin-bottom: 20px;
+    }
+    .metric-card {
+        background-color: #f8f9fa;
+        border-radius: 8px;
+        padding: 12px;
+        border: 1px solid #e0e0e0;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+
 # ==============================================================================
-# 2. MODULE KẾT NỐI DỮ LIỆU THỰC TẾ (TCBS REST API)
+# DANH SÁCH MÃ CHỨNG KHOÁN MẪU (TOP THANH KHOẢN & DẪN DẮT THỊ TRƯỜNG)
 # ==============================================================================
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_tcbs_ohlcv(symbol: str, lookback_days: int = 400) -> Optional[pd.DataFrame]:
-    """
-    Tải trực tiếp dữ liệu nến ngày từ API mở của TCBS.
-    Sử dụng cache 30 phút để chống nghẽn và tăng tốc độ phản hồi.
-    """
-    clean_symbol = symbol.strip().upper()
-    end_ts = int(time.time())
-    start_ts = int(end_ts - (lookback_days * 86400))
-    
-    url = f"https://apipubaws.tcbs.com.vn/stock-insight/v1/stock/bars-long-term?ticker={clean_symbol}&type=stock&resolution=D&from={start_ts}&to={end_ts}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+VN30_LIST = [
+    "ACB", "BCM", "BID", "BVH", "CTG", "FPT", "GAS", "GVR", "HDB", "HPG", 
+    "MBB", "MSN", "MWG", "PLX", "POW", "SAB", "SHB", "SSB", "SSI", "STB", 
+    "TCB", "TPB", "VCB", "VHM", "VIB", "VIC", "VJC", "VNM", "VPB", "VRE"
+]
+
+GROWTH_WATCHLIST = VN30_LIST + [
+    "DGC", "FRT", "PVD", "PVS", "KDH", "NLG", "KBC", "DIG", "DXG", 
+    "VIX", "VND", "HCM", "DCM", "DPM", "HSG", "NKG", "GEX", "PC1", "ANV"
+]
+
+# Loại bỏ trùng lặp và sắp xếp
+GROWTH_WATCHLIST = sorted(list(set(GROWTH_WATCHLIST)))
+
+
+# ==============================================================================
+# MODULE TRUY XUẤT DỮ LIỆU CHỨNG KHOÁN (TCBS API)
+# ==============================================================================
+class TCBSDataProvider:
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json"
     }
 
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code != 200:
-            return None
+    @staticmethod
+    def get_price_history(symbol: str, days_back: int = 400) -> pd.DataFrame:
+        """Lấy lịch sử nến ngày (OHLCV) từ TCBS."""
+        try:
+            end_ts = int(time.time())
+            start_ts = end_ts - (days_back * 86400)
+            url = f"https://apipubaws.tcbs.com.vn/stock-insight/v1/stock/bars-long-term?ticker={symbol}&type=stock&resolution=D&from={start_ts}&to={end_ts}"
             
-        payload = response.json()
-        if not payload or "data" not in payload or not payload["data"]:
-            return None
+            response = requests.get(url, headers=TCBSDataProvider.HEADERS, timeout=8)
+            if response.status_code != 200:
+                return pd.DataFrame()
+            
+            data = response.json().get("data", [])
+            if not data:
+                return pd.DataFrame()
+            
+            df = pd.DataFrame(data)
+            df['tradingDate'] = pd.to_datetime(df['tradingDate'])
+            df = df.sort_values('tradingDate').reset_index(drop=True)
+            
+            # Chuẩn hóa cột
+            df = df[['tradingDate', 'open', 'high', 'low', 'close', 'volume']]
+            df.columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+            
+            # Chia giá về đúng đơn vị nghìn đồng nếu dữ liệu thô nhân 1000
+            if df['Close'].iloc[-1] > 1000:
+                df[['Open', 'High', 'Low', 'Close']] = df[['Open', 'High', 'Low', 'Close']] / 1000.0
+                
+            return df
+        except Exception:
+            return pd.DataFrame()
 
-        df = pd.DataFrame(payload["data"])
-        # Đổi tên cột chuẩn hóa
-        df.rename(columns={
-            "tradingDate": "date",
-            "open": "open",
-            "high": "high",
-            "low": "low",
-            "close": "close",
-            "volume": "volume"
-        }, inplace=True)
+    @staticmethod
+    def get_financial_ratios(symbol: str) -> dict:
+        """Lấy chỉ số tài chính (EPS, Doanh thu, ROE) theo quý từ TCBS."""
+        default_res = {
+            "roe": 0.0,
+            "eps_growth_yoy": 0.0,
+            "rev_growth_yoy": 0.0,
+            "quarter": "N/A"
+        }
+        try:
+            url = f"https://apipubaws.tcbs.com.vn/tcanalysis/v1/finance/{symbol}/financialratio?yearly=0&isAll=false"
+            response = requests.get(url, headers=TCBSDataProvider.HEADERS, timeout=6)
+            if response.status_code != 200:
+                return default_res
 
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.sort_values('date').reset_index(drop=True)
-        # Loại bỏ các phiên lỗi thanh khoản
-        df = df[df['volume'] > 0].reset_index(drop=True)
-        
-        return df
-    except Exception:
+            items = response.json()
+            if not isinstance(items, list) or len(items) == 0:
+                return default_res
+
+            # Sắp xếp quý mới nhất lên đầu
+            items = sorted(items, key=lambda x: (x.get('year', 0), x.get('quarter', 0)), reverse=True)
+            latest = items[0]
+            
+            # ROE (TCBS trả về theo % vd 18.5)
+            roe = float(latest.get('roe', 0) or 0)
+            if roe <= 1.0 and roe > 0:
+                roe = roe * 100  # Quy đổi nếu tỷ lệ thập phân
+
+            # Tăng trưởng EPS và Doanh thu so với cùng kỳ năm trước (4 quý trước)
+            eps_growth = 0.0
+            rev_growth = 0.0
+            
+            if len(items) >= 5:
+                prev_year_quarter = items[4] # Quý cùng kỳ năm ngoái
+                
+                # EPS growth
+                curr_eps = float(latest.get('earningPerShare', 0) or 0)
+                prev_eps = float(prev_year_quarter.get('earningPerShare', 0) or 0)
+                if prev_eps > 0:
+                    eps_growth = ((curr_eps - prev_eps) / abs(prev_eps)) * 100
+                
+                # Doanh thu / Lợi nhuận gộp growth
+                curr_rev = float(latest.get('netRevenue', 0) or latest.get('revenue', 0) or 0)
+                prev_rev = float(prev_year_quarter.get('netRevenue', 0) or prev_year_quarter.get('revenue', 0) or 0)
+                if prev_rev > 0:
+                    rev_growth = ((curr_rev - prev_rev) / abs(prev_rev)) * 100
+
+            q_label = f"Q{latest.get('quarter', '?')}/{latest.get('year', '?')}"
+            
+            return {
+                "roe": round(roe, 2),
+                "eps_growth_yoy": round(eps_growth, 2),
+                "rev_growth_yoy": round(rev_growth, 2),
+                "quarter": q_label
+            }
+        except Exception:
+            return default_res
+
+
+# ==============================================================================
+# BỘ TÍNH TOÁN BỘ LỌC KỸ THUẬT & CƠ BẢN
+# ==============================================================================
+def analyze_stock(symbol: str, params: dict) -> dict:
+    """Phân tích kỹ thuật SEPA Minervini + Pivot Livermore kết hợp chỉ số FA."""
+    df = TCBSDataProvider.get_price_history(symbol, days_back=380)
+    
+    # Yêu cầu tối thiểu 210 phiên giao dịch để tính MA200 và độ dốc 20 phiên
+    if df.empty or len(df) < 210:
         return None
 
-# ==============================================================================
-# 3. THUẬT TOÁN ĐỊNH LƯỢNG: TREND TEMPLATE & VCP (MINERVINI ENGINE)
-# ==============================================================================
-def compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Tính toán MA50, MA150, MA200 và Volume MA20 bằng Pandas thuần túy."""
-    df_calc = df.copy()
-    df_calc['MA50'] = df_calc['close'].rolling(window=50).mean()
-    df_calc['MA150'] = df_calc['close'].rolling(window=150).mean()
-    df_calc['MA200'] = df_calc['close'].rolling(window=200).mean()
-    df_calc['VOL_MA20'] = df_calc['volume'].rolling(window=20).mean()
-    return df_calc
+    # Tính toán các chỉ báo Kỹ thuật cơ bản
+    df['MA50'] = df['Close'].rolling(window=params['ma_fast']).mean()
+    df['MA150'] = df['Close'].rolling(window=params['ma_mid']).mean()
+    df['MA200'] = df['Close'].rolling(window=params['ma_slow']).mean()
+    df['MA20_Vol'] = df['Volume'].rolling(window=20).mean()
 
-def evaluate_minervini_system(df: pd.DataFrame) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Đánh giá tiêu chuẩn Trend Template và nhận diện nhịp siết VCP:
-    1. Trend Template: Giá > MA50 > MA150 > MA200; MA200 dốc lên; Giá > Đáy 52W + 25%
-    2. VCP: Co hẹp biến động qua 3 nhịp và Thanh khoản cạn kiệt (Volume Dry-Up).
-    """
-    result = {"is_uptrend": False, "is_vcp": False, "is_breakout": False, "data": {}}
+    # Tính True Range và ATR để đánh giá biên độ nén giá VCP
+    df['H-L'] = df['High'] - df['Low']
+    df['H-PC'] = abs(df['High'] - df['Close'].shift(1))
+    df['L-PC'] = abs(df['Low'] - df['Close'].shift(1))
+    df['TR'] = df[['H-L', 'H-PC', 'L-PC']].max(axis=1)
+    df['ATR5'] = df['TR'].rolling(window=5).mean()
+    df['ATR20'] = df['TR'].rolling(window=20).mean()
+
+    # Dữ liệu phiên hiện tại và quá khứ
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
+    ma200_20d_ago = df['MA200'].iloc[-21] if len(df) >= 221 else df['MA200'].iloc[0]
+
+    close_p = curr['Close']
+    change_pct = ((close_p - prev['Close']) / prev['Close']) * 100
+
+    # Đỉnh/Đáy 52 tuần (~250 phiên gần nhất)
+    lookback_52w = min(len(df), 250)
+    high_52w = df['High'].iloc[-lookback_52w:].max()
+    low_52w = df['Low'].iloc[-lookback_52w:].min()
+
+    pct_above_low = ((close_p - low_52w) / low_52w) * 100
+    pct_below_high = ((high_52w - close_p) / high_52w) * 100
+
+    # 1. TIÊU CHÍ TREND TEMPLATE (MINERVINI SEPA)
+    cond_ma_stack = (close_p > curr['MA50']) and (curr['MA50'] > curr['MA150']) and (curr['MA150'] > curr['MA200'])
+    cond_ma200_up = curr['MA200'] > ma200_20d_ago
+    cond_52w_low = pct_above_low >= params['min_from_low']
+    cond_52w_high = pct_below_high <= params['max_from_high']
     
-    # Yêu cầu tối thiểu 220 phiên để xác định MA200 và độ dốc MA200 1 tháng
-    if len(df) < 220:
-        return False, result
+    pass_trend_template = cond_ma_stack and cond_ma200_up and cond_52w_low and cond_52w_high
 
-    curr_price = float(df['close'].iloc[-1])
-    ma50 = float(df['MA50'].iloc[-1])
-    ma150 = float(df['MA150'].iloc[-1])
-    ma200 = float(df['MA200'].iloc[-1])
-    ma200_1m_ago = float(df['MA200'].iloc[-22])
+    # 2. TIÊU CHÍ VCP & PIVOT BREAKOUT (LIVERMORE & MINERVINI)
+    # VCP: Biên độ 5 phiên gần nhất thu hẹp đáng kể so với bình quân 20 phiên
+    is_vcp = curr['ATR5'] < (curr['ATR20'] * 0.75)
 
-    period_52w = min(250, len(df))
-    high_52w = float(df['high'].iloc[-period_52w:].max())
-    low_52w = float(df['low'].iloc[-period_52w:].min())
+    # Volume Dry-up: Trung bình 3 phiên gần nhất cạn kiệt (< 80% MA20 Volume)
+    avg_vol_3d = df['Volume'].iloc[-3:].mean()
+    is_vol_dryup = avg_vol_3d < (0.8 * curr['MA20_Vol'])
 
-    # 1. Trend Template Rules
-    cond_ma_align = (curr_price > ma50) and (ma50 > ma150) and (ma150 > ma200)
-    cond_ma200_up = ma200 > ma200_1m_ago
-    cond_52w_low = curr_price >= (low_52w * 1.25)
-    cond_52w_high = curr_price >= (high_52w * 0.80)
+    # Pivot / Pocket Breakout: Phiên nay tăng mạnh kèm vol vượt trội
+    is_breakout = (change_pct >= params['breakout_price_pct']) and (curr['Volume'] >= (params['breakout_vol_mult'] * curr['MA20_Vol']))
 
-    is_uptrend = cond_ma_align and cond_ma200_up and cond_52w_low and cond_52w_high
+    # 3. CHỈ SỐ CƠ BẢN (FA)
+    fa_data = {"roe": 0.0, "eps_growth_yoy": 0.0, "rev_growth_yoy": 0.0, "quarter": "N/A"}
+    if params['use_fa_filter']:
+        fa_data = TCBSDataProvider.get_financial_ratios(symbol)
 
-    # 2. Thuật toán nhận diện VCP (3 nhịp co hẹp trong 50 phiên gần nhất)
-    # Nhịp 1: [-50:-30], Nhịp 2: [-30:-12], Nhịp 3: [-12:-1]
-    w1 = df.iloc[-50:-30]
-    w2 = df.iloc[-30:-12]
-    w3 = df.iloc[-12:-1]
+    pass_fa = True
+    if params['use_fa_filter']:
+        pass_fa = (
+            fa_data['eps_growth_yoy'] >= params['min_eps_growth'] and
+            fa_data['rev_growth_yoy'] >= params['min_rev_growth'] and
+            fa_data['roe'] >= params['min_roe']
+        )
 
-    d1 = ((w1['high'].max() - w1['low'].min()) / w1['high'].max()) * 100
-    d2 = ((w2['high'].max() - w2['low'].min()) / w2['high'].max()) * 100
-    d3 = ((w3['high'].max() - w3['low'].min()) / w3['high'].max()) * 100
+    # ĐIỂM KỸ THUẬT TỔNG HỢP (TECHNICAL SCORE - Thang 100)
+    score = 0
+    if cond_ma_stack: score += 30
+    if cond_ma200_up: score += 15
+    if cond_52w_low and cond_52w_high: score += 15
+    if is_vcp or is_vol_dryup: score += 15
+    if is_breakout: score += 25
 
-    # Điều kiện VCP: Biên độ thu hẹp dần và nhịp cuối cùng d3 phải cực kỳ chặt chẽ (<= 8%)
-    is_vcp = (d1 > d2) and (d2 > d3) and (d3 <= 8.0) and (d1 <= 28.0)
-
-    # 3. Kiểm tra Cạn Kiệt Thanh Khoản (Volume Dry-Up - VDU)
-    vol_ma20 = float(df['VOL_MA20'].iloc[-1])
-    last_3d_vol = float(df['volume'].iloc[-4:-1].mean())
-    is_vdu = (last_3d_vol <= 0.65 * vol_ma20) if vol_ma20 > 0 else False
-
-    # 4. Xác định Điểm Pivot & Quản trị rủi ro
-    pivot_point = float(w3['high'].max())
-    curr_vol = float(df['volume'].iloc[-1])
-    is_breakout = (curr_price >= pivot_point) and (curr_vol >= 1.3 * vol_ma20)
-
-    # Hard-stop: Tối đa 6.5% - 7.0%
-    stop_loss = round(curr_price * 0.935, 2)
-    risk_unit = curr_price - stop_loss
-    target_price = round(curr_price + (risk_unit * 2.5), 2)  # R:R = 1:2.5
-
-    result["is_uptrend"] = is_uptrend
-    result["is_vcp"] = is_vcp
-    result["is_breakout"] = is_breakout
-    result["data"] = {
-        "current_price": curr_price,
-        "pivot_point": pivot_point,
-        "stop_loss": stop_loss,
-        "target_price": target_price,
-        "contractions": f"-{d1:.1f}% | -{d2:.1f}% | -{d3:.1f}%",
-        "vdu_ratio": round(last_3d_vol / vol_ma20, 2) if vol_ma20 > 0 else 0,
-        "pct_from_52w_low": round(((curr_price - low_52w) / low_52w) * 100, 1),
-        "pct_from_52w_high": round(((curr_price - high_52w) / high_52w) * 100, 1)
+    return {
+        "Symbol": symbol,
+        "Close": round(close_p, 2),
+        "Change_%": round(change_pct, 2),
+        "Volume": int(curr['Volume']),
+        "MA50": round(curr['MA50'], 2),
+        "MA150": round(curr['MA150'], 2),
+        "MA200": round(curr['MA200'], 2),
+        "High_52W": round(high_52w, 2),
+        "Low_52W": round(low_52w, 2),
+        "Cách_Đỉnh_%": round(pct_below_high, 1),
+        "Trên_Đáy_%": round(pct_above_low, 1),
+        "Trend_Template": pass_trend_template,
+        "VCP_VolDryup": (is_vcp or is_vol_dryup),
+        "Pivot_Breakout": is_breakout,
+        "Pass_FA": pass_fa,
+        "Score": score,
+        "ROE_%": fa_data['roe'],
+        "EPS_Growth_%": fa_data['eps_growth_yoy'],
+        "Rev_Growth_%": fa_data['rev_growth_yoy'],
+        "FA_Quarter": fa_data['quarter']
     }
 
-    return is_uptrend, result
 
 # ==============================================================================
-# 4. MODULE CƠ SỞ DỮ LIỆU SQLITE (TRADING JOURNAL)
+# HÀM VẼ BIỂU ĐỒ NẾN KỸ THUẬT CHUYÊN NGHIỆP (PLOTLY)
 # ==============================================================================
-DB_PATH = "trading_journal.db"
+def plot_stock_chart(symbol: str):
+    """Vẽ biểu đồ tương tác Nến Nhật, Khối lượng và các đường MA."""
+    df = TCBSDataProvider.get_price_history(symbol, days_back=260)
+    if df.empty:
+        st.warning(f"Không thể tải đồ thị kỹ thuật cho mã {symbol}.")
+        return
 
-def init_sqlite_db():
-    """Khởi tạo bảng quản lý nhật ký lệnh."""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS journal (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                entry_date TEXT NOT NULL,
-                entry_price REAL NOT NULL,
-                quantity INTEGER NOT NULL,
-                stop_loss REAL NOT NULL,
-                target_price REAL NOT NULL,
-                exit_price REAL,
-                status TEXT NOT NULL,
-                reason TEXT,
-                pnl REAL DEFAULT 0,
-                pnl_pct REAL DEFAULT 0
-            )
-        ''')
-        conn.commit()
-        conn.close()
-    except Exception:
-        pass
+    df['MA50'] = df['Close'].rolling(50).mean()
+    df['MA150'] = df['Close'].rolling(150).mean()
+    df['MA200'] = df['Close'].rolling(200).mean()
+    df['MA20_Vol'] = df['Volume'].rolling(20).mean()
 
-init_sqlite_db()
+    # Màu nến theo tiêu chuẩn Việt Nam (Xanh lá / Đỏ)
+    colors = ['#00C076' if row['Close'] >= row['Open'] else '#FF3B30' for _, row in df.iterrows()]
 
-def log_trade(symbol: str, price: float, qty: int, sl: float, tp: float, reason: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    today = datetime.date.today().strftime("%Y-%m-%d")
-    c.execute('''
-        INSERT INTO journal (symbol, entry_date, entry_price, quantity, stop_loss, target_price, status, reason)
-        VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?)
-    ''', (symbol.upper(), today, price, qty, sl, tp, reason))
-    conn.commit()
-    conn.close()
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        row_heights=[0.7, 0.3],
+        specs=[[{"type": "candlestick"}], [{"type": "bar"}]]
+    )
 
-def close_trade_record(trade_id: int, exit_price: float):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT entry_price, quantity FROM journal WHERE id = ?", (trade_id,))
-    row = c.fetchone()
-    if row:
-        e_price, qty = row[0], row[1]
-        pnl = (exit_price - e_price) * qty
-        pnl_pct = ((exit_price - e_price) / e_price) * 100
-        c.execute('''
-            UPDATE journal
-            SET exit_price = ?, status = 'CLOSED', pnl = ?, pnl_pct = ?
-            WHERE id = ?
-        ''', (exit_price, pnl, pnl_pct, trade_id))
-        conn.commit()
-    conn.close()
+    # Nến Candlestick
+    fig.add_trace(
+        go.Candlestick(
+            x=df['Date'],
+            open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
+            name="Giá",
+            increasing_line_color='#00C076', decreasing_line_color='#FF3B30'
+        ),
+        row=1, col=1
+    )
 
-def fetch_journal() -> pd.DataFrame:
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT * FROM journal ORDER BY id DESC", conn)
-    conn.close()
-    return df
+    # Các đường MA
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA50'], line=dict(color='#2962FF', width=1.5), name="MA50 (Ngắn hạn)"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA150'], line=dict(color='#FF6D00', width=1.5), name="MA150 (Trung hạn)"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA200'], line=dict(color='#D500F9', width=2), name="MA200 (Dài hạn)"), row=1, col=1)
+
+    # Cột Volume và MA20 Volume
+    fig.add_trace(go.Bar(x=df['Date'], y=df['Volume'], marker_color=colors, name="Khối lượng"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['MA20_Vol'], line=dict(color='#FFA000', width=1.2), name="MA20 Khối lượng"), row=2, col=1)
+
+    fig.update_layout(
+        title=f"ĐỒ THỊ KỸ THUẬT CỔ PHIẾU {symbol} - MINERVINI SETUP",
+        yaxis_title="Giá (1,000 VND)",
+        yaxis2_title="Khối lượng",
+        xaxis_rangeslider_visible=False,
+        height=580,
+        margin=dict(l=40, r=40, t=50, b=30),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
 
 # ==============================================================================
-# 5. GIAO DIỆN NGƯỜI DÙNG STREAMLIT
+# GIAO DIỆN CHÍNH (STREAMLIT UI)
 # ==============================================================================
-st.sidebar.title("⚡ Minervini Hub")
-st.sidebar.markdown("**Hệ thống Lọc VCP & Quản trị Rủi ro**")
+st.markdown('<div class="main-title">⚡ REALTIME VIETNAM STOCK SCREENER</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">Hệ thống lọc cổ phiếu tăng trưởng theo phương pháp Minervini SEPA & Điểm nổ Livermore Pivot</div>', unsafe_allow_html=True)
 
-default_list = "FPT, SSI, HPG, MWG, DGC, VHC, PVS, PVD, VCI, MBB, TCB, CTG, ACB, FRT"
-watchlist_input = st.sidebar.text_area(
-    "Danh sách mã quét:",
-    value=default_list,
-    height=120
-)
-
-# 3 Tab điều hướng chính
-tab1, tab2, tab3 = st.tabs([
-    "📈 Quét & Phân Tích Kỹ Thuật", 
-    "⚖️ Quản Trị Vị Thế (Livermore)", 
-    "📓 Sổ Lệnh Nhật Ký (SQLite)"
-])
-
-# ------------------------------------------------------------------------------
-# TAB 1: BỘ LỌC VCP & ĐỒ THỊ STREAMLIT NATIVE
-# ------------------------------------------------------------------------------
-with tab1:
-    st.subheader("Bộ Lọc Trend Template & Nhận Diện VCP Tự Động")
-
-    col_btn1, col_btn2 = st.columns([2, 5])
-    with col_btn1:
-        start_scan = st.button("🚀 Quét Toàn Bộ Danh Sách", use_container_width=True)
-
-    if start_scan:
-        tickers = [t.strip().upper() for t in watchlist_input.split(",") if t.strip()]
-        scan_results = []
-        progress_bar = st.progress(0)
-
-        for i, sym in enumerate(tickers):
-            try:
-                raw_df = get_tcbs_ohlcv(sym)
-                if raw_df is not None and len(raw_df) >= 220:
-                    df_calc = compute_technical_indicators(raw_df)
-                    is_uptrend, details = evaluate_minervini_system(df_calc)
-                    
-                    if is_uptrend:
-                        d = details["data"]
-                        status = "⭐ PIVOT BREAKOUT" if details["is_breakout"] else ("🔥 VCP TÍCH LŨY" if details["is_vcp"] else "✅ UPTREND ĐẠT CHUẨN")
-                        scan_results.append({
-                            "Mã CP": sym,
-                            "Trạng Thái": status,
-                            "Giá HT": d["current_price"],
-                            "Điểm Pivot": d["pivot_point"],
-                            "Nhịp Siết VCP": d["contractions"],
-                            "Tỷ Lệ Vol Cạn": f"{d['vdu_ratio']}x",
-                            "Cắt Lỗ (-6.5%)": d["stop_loss"],
-                            "Mục Tiêu (1:2.5)": d["target_price"],
-                            "% Đáy 52W": f"+{d['pct_from_52w_low']}%"
-                        })
-            except Exception:
-                pass
-            progress_bar.progress((i + 1) / len(tickers))
-
-        if scan_results:
-            st.session_state["scan_data"] = scan_results
-            st.success(f"Quét hoàn tất: Tìm thấy {len(scan_results)} mã đạt chuẩn Giai đoạn 2 (Uptrend)!")
-        else:
-            st.warning("Không có mã nào đạt tiêu chí Trend Template.")
-
-    if "scan_data" in st.session_state and st.session_state["scan_data"]:
-        st.dataframe(pd.DataFrame(st.session_state["scan_data"]), use_container_width=True)
-
-    st.markdown("---")
-    st.subheader("Biểu Đồ Kỹ Thuật Tinh Gọn (Native Line Chart)")
+# --- SIDEBAR: CẤU HÌNH BỘ LỌC ---
+with st.sidebar:
+    st.header("⚙️ THIẾT LẬP BỘ LỌC")
     
-    chart_col1, chart_col2 = st.columns([2, 5])
-    with chart_col1:
-        inspect_ticker = st.text_input("Nhập mã xem biểu đồ:", value="FPT").upper()
-        lookback = st.slider("Số phiên hiển thị:", min_value=60, max_value=250, value=120)
+    universe_choice = st.selectbox(
+        "🎯 Danh sách theo dõi:",
+        ["Top Cổ Phiếu Thanh Khoản (45 mã)", "VN30 Index (30 mã lớn)", "Tùy nhập danh sách"]
+    )
+    
+    if universe_choice == "Top Cổ Phiếu Thanh Khoản (45 mã)":
+        target_tickers = GROWTH_WATCHLIST
+    elif universe_choice == "VN30 Index (30 mã lớn)":
+        target_tickers = VN30_LIST
+    else:
+        custom_input = st.text_area("Nhập các mã (ngăn cách bằng dấu phẩy):", "FPT, HPG, SSI, DGC, MWG, TCB, VHM")
+        target_tickers = [x.strip().upper() for x in custom_input.split(",") if x.strip()]
 
-    if inspect_ticker:
-        c_df = get_tcbs_ohlcv(inspect_ticker)
-        if c_df is not None and len(c_df) >= 200:
-            c_df = compute_technical_indicators(c_df)
-            plot_df = c_df.iloc[-lookback:].copy()
-            plot_df.set_index('date', inplace=True)
+    st.markdown("---")
+    st.subheader("1. Bộ Tiêu Chí Kỹ Thuật (SEPA)")
+    require_trend = st.checkbox("Bắt buộc đạt Trend Template (MA50>150>200)", value=True)
+    require_pivot = st.checkbox("Ưu tiên điểm bùng nổ (Pocket/Pivot Breakout)", value=False)
+    
+    col_sb1, col_sb2 = st.columns(2)
+    with col_sb1:
+        min_from_low = st.number_input("% Trên Đáy 52W:", min_value=0, max_value=200, value=25)
+        breakout_price_pct = st.number_input("% Tăng giá Breakout:", min_value=1.0, max_value=10.0, value=2.5, step=0.5)
+    with col_sb2:
+        max_from_high = st.number_input("% Cách Đỉnh 52W:", min_value=5, max_value=100, value=25)
+        breakout_vol_mult = st.number_input("Tỷ lệ Vol bùng nổ:", min_value=1.0, max_value=5.0, value=1.4, step=0.2)
 
-            st.write(f"**Cấu trúc Xu hướng Giá & MA50 / MA150 / MA200 - {inspect_ticker}**")
-            # Sử dụng st.line_chart có sẵn của Streamlit
-            st.line_chart(
-                plot_df[['close', 'MA50', 'MA150', 'MA200']],
-                height=350,
-                use_container_width=True
+    st.markdown("---")
+    st.subheader("2. Bộ Tiêu Chí Cơ Bản (FA)")
+    use_fa_filter = st.checkbox("Kích hoạt lọc cơ bản (FA)", value=False)
+    
+    min_eps_growth = 20.0
+    min_rev_growth = 15.0
+    min_roe = 15.0
+    if use_fa_filter:
+        min_eps_growth = st.slider("Tăng trưởng EPS YoY tối thiểu (%):", 0, 100, 20)
+        min_rev_growth = st.slider("Tăng trưởng Doanh thu YoY (%):", 0, 100, 15)
+        min_roe = st.slider("ROE tối thiểu (%):", 0, 50, 15)
+
+    params = {
+        "ma_fast": 50,
+        "ma_mid": 150,
+        "ma_slow": 200,
+        "min_from_low": min_from_low,
+        "max_from_high": max_from_high,
+        "breakout_price_pct": breakout_price_pct,
+        "breakout_vol_mult": breakout_vol_mult,
+        "use_fa_filter": use_fa_filter,
+        "min_eps_growth": min_eps_growth,
+        "min_rev_growth": min_rev_growth,
+        "min_roe": min_roe
+    }
+
+    start_scan_btn = st.button("🚀 BẮT ĐẦU LỌC CỔ PHIẾU", type="primary", use_container_width=True)
+
+# Khởi tạo state kết quả nếu chưa có
+if "scan_results" not in st.session_state:
+    st.session_state.scan_results = None
+
+# --- XỬ LÝ LỌC CỔ PHIẾU ---
+if start_scan_btn:
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    status_text.text(f"Đang phân tích {len(target_tickers)} mã cổ phiếu...")
+
+    results = []
+    completed = 0
+    total = len(target_tickers)
+
+    # Dùng đa luồng (10 worker) để quét song song với tốc độ cao
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_stock = {executor.submit(analyze_stock, ticker, params): ticker for ticker in target_tickers}
+        for future in as_completed(future_to_stock):
+            res = future.result()
+            if res:
+                results.append(res)
+            completed += 1
+            progress_bar.progress(completed / total)
+
+    status_text.text("Phân tích hoàn tất!")
+    progress_bar.empty()
+    status_text.empty()
+    st.session_state.scan_results = results
+
+# --- HIỂN THỊ KẾT QUẢ ---
+if st.session_state.scan_results:
+    raw_df = pd.DataFrame(st.session_state.scan_results)
+    
+    # Áp dụng các điều kiện lọc theo cấu hình
+    filtered_df = raw_df.copy()
+    if require_trend:
+        filtered_df = filtered_df[filtered_df['Trend_Template'] == True]
+    if require_pivot:
+        filtered_df = filtered_df[filtered_df['Pivot_Breakout'] == True]
+    if use_fa_filter:
+        filtered_df = filtered_df[filtered_df['Pass_FA'] == True]
+
+    # Sắp xếp theo điểm kỹ thuật giảm dần
+    filtered_df = filtered_df.sort_values(by=["Score", "Change_%"], ascending=[False, False]).reset_index(drop=True)
+
+    st.subheader(f"📊 KẾT QUẢ QUÉT: Tìm thấy {len(filtered_df)} / {len(raw_df)} cổ phiếu đạt điều kiện")
+
+    if not filtered_df.empty:
+        # Bảng hiển thị giao diện đẹp mắt
+        display_cols = [
+            "Symbol", "Close", "Change_%", "Volume", "Cách_Đỉnh_%", "Trên_Đáy_%",
+            "Trend_Template", "VCP_VolDryup", "Pivot_Breakout", "Score"
+        ]
+        if use_fa_filter:
+            display_cols += ["ROE_%", "EPS_Growth_%", "Rev_Growth_%", "FA_Quarter"]
+
+        styled_df = filtered_df[display_cols].copy()
+        
+        # Định dạng icon cho các cột tín hiệu
+        styled_df['Trend_Template'] = styled_df['Trend_Template'].apply(lambda x: "🟢 Đạt" if x else "⚪ Không")
+        styled_df['VCP_VolDryup'] = styled_df['VCP_VolDryup'].apply(lambda x: "🔥 Cạn/VCP" if x else "-")
+        styled_df['Pivot_Breakout'] = styled_df['Pivot_Breakout'].apply(lambda x: "🚀 Pivot Nổ" if x else "-")
+
+        st.dataframe(
+            styled_df.style.format({
+                "Close": "{:.2f}",
+                "Change_%": "{:+.2f}%",
+                "Volume": "{:,.0f}",
+                "Cách_Đỉnh_%": "-{:.1f}%",
+                "Trên_Đáy_%": "+{:.1f}%",
+                "Score": "{:.0f}/100"
+            }),
+            use_container_width=True,
+            height=300
+        )
+
+        # Xuất file Excel / CSV
+        col_dl1, col_dl2 = st.columns([1, 5])
+        with col_dl1:
+            csv_buffer = io.StringIO()
+            styled_df.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
+            st.download_button(
+                label="📥 Tải kết quả CSV",
+                data=csv_buffer.getvalue(),
+                file_name=f"stock_screener_{time.strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv"
             )
 
-            st.write(f"**Khối Lượng & Đường Trung Bình Khối Lượng 20 Phiên**")
-            # Sử dụng st.bar_chart có sẵn của Streamlit
-            st.bar_chart(
-                plot_df['volume'],
-                height=150,
-                use_container_width=True
-            )
-        else:
-            st.info("Chưa có đủ dữ liệu lịch sử để hiển thị cho mã này.")
+        st.markdown("---")
+        # --- PHẦN CHI TIẾT & BIỂU ĐỒ NẾN CHO TỪNG CỔ PHIẾU ---
+        st.subheader("🔍 PHÂN TÍCH KỸ THUẬT CHI TIẾT THEO MÃ")
+        
+        col_sel1, col_sel2 = st.columns([2, 5])
+        with col_sel1:
+            selected_symbol = st.selectbox("Chọn cổ phiếu để soi biểu đồ:", filtered_df['Symbol'].tolist())
 
-# ------------------------------------------------------------------------------
-# TAB 2: QUẢN TRỊ RỦI RO & PHÂN BỔ VỊ THẾ (LIVERMORE 1-2% RULE)
-# ------------------------------------------------------------------------------
-with tab2:
-    st.subheader("Máy Tính Định Lượng Vị Thế (Position Sizing Calculator)")
-    st.markdown("""
-    > **Nguyên tắc Quản trị Vốn của Mark Minervini:**
-    > *Không bao giờ để một giao dịch đơn lẻ gây thua lỗ quá **1.0% - 2.0%** tổng NAV tài khoản. Mức dừng lỗ tối đa tuyệt đối là **7.0%**.*
-    """)
+        if selected_symbol:
+            stock_info = filtered_df[filtered_df['Symbol'] == selected_symbol].iloc[0]
+            
+            # Thẻ tóm tắt chỉ số (KPI Cards)
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Giá hiện tại", f"{stock_info['Close']:.2f}", f"{stock_info['Change_%']:+.2f}%")
+            c2.metric("Điểm Kỹ Thuật", f"{stock_info['Score']}/100")
+            c3.metric("Cách Đỉnh 52 Tuần", f"-{stock_info['Cách_Đỉnh_%']}%")
+            c4.metric("ROE (Quý gần nhất)", f"{stock_info['ROE_%']}%" if use_fa_filter else "N/A")
+            c5.metric("Tăng trưởng EPS", f"{stock_info['EPS_Growth_%']}%" if use_fa_filter else "N/A")
 
-    col_c1, col_c2, col_c3 = st.columns(3)
-    with col_c1:
-        nav = st.number_input("Tổng quy mô vốn (NAV) VNĐ:", min_value=10_000_000, value=500_000_000, step=50_000_000, format="%d")
-    with col_c2:
-        risk_pct = st.slider("Mức rủi ro chấp nhận (% NAV):", min_value=0.5, max_value=2.5, value=1.5, step=0.1)
-    with col_c3:
-        max_allowed_risk = nav * (risk_pct / 100)
-        st.metric("Rủi ro tối đa cho phép / 1 lệnh", f"{max_allowed_risk:,.0f} VNĐ")
-
-    st.markdown("---")
-    col_p1, col_p2, col_p3 = st.columns(3)
-    with col_p1:
-        entry_price = st.number_input("Giá mua kế hoạch (VNĐ):", value=45000, step=500)
-    with col_p2:
-        stop_price = st.number_input("Giá cắt lỗ (Stop-Loss VNĐ):", value=42000, step=500)
-    with col_p3:
-        target_price = st.number_input("Giá chốt lời dự kiến (VNĐ):", value=52500, step=500)
-
-    if entry_price > stop_price:
-        risk_per_share = entry_price - stop_price
-        sl_pct = (risk_per_share / entry_price) * 100
-        reward_per_share = target_price - entry_price
-        rr_ratio = (reward_per_share / risk_per_share) if risk_per_share > 0 else 0
-
-        # Số cổ phiếu tối đa = Rủi ro tối đa cho phép / Rủi ro trên 1 cổ phiếu
-        max_shares = int(max_allowed_risk // risk_per_share)
-        total_trade_value = max_shares * entry_price
-        portfolio_exposure = (total_trade_value / nav) * 100
-
-        st.markdown("### Kết Quả Tính Toán:")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Khối lượng mua tối đa", f"{max_shares:,.0f} CP")
-        m2.metric("Tỷ trọng giải ngân / NAV", f"{portfolio_exposure:.1f}%")
-        m3.metric("Tỷ lệ Cắt Lỗ", f"-{sl_pct:.2f}%", delta=f"-{sl_pct:.2f}%", delta_color="inverse")
-        m4.metric("Tỷ lệ Risk : Reward", f"1 : {rr_ratio:.2f}")
-
-        if sl_pct > 7.0:
-            st.error(f"⚠️ Mức cắt lỗ (-{sl_pct:.2f}%) vượt trần an toàn 7% của Mark Minervini!")
-        elif rr_ratio < 2.0:
-            st.warning(f"⚠️ Tỷ lệ R:R (1:{rr_ratio:.2f}) nhỏ hơn 1:2.0 tiêu chuẩn.")
-        else:
-            st.success("✅ Vị thế đạt chuẩn quản trị rủi ro hoàn hảo!")
-
-# ------------------------------------------------------------------------------
-# TAB 3: NHẬT KÝ GIAO DỊCH SQLITE
-# ------------------------------------------------------------------------------
-with tab3:
-    st.subheader("Nhật Ký Giao Dịch & Quản Lý Lệnh (SQLite)")
-
-    with st.expander("➕ Ghi nhận vị thế vào lệnh mới", expanded=False):
-        f1, f2, f3, f4 = st.columns(4)
-        with f1:
-            sym_in = st.text_input("Mã cổ phiếu:", "FPT").upper()
-            price_in = st.number_input("Giá mua:", value=100000, step=500)
-        with f2:
-            qty_in = st.number_input("Khối lượng:", value=1000, step=100)
-            sl_in = st.number_input("Giá cắt lỗ:", value=93500, step=500)
-        with f3:
-            tp_in = st.number_input("Giá chốt lời:", value=116000, step=500)
-            reason_in = st.text_input("Lý do vào lệnh:", "Minervini VCP Pivot")
-        with f4:
-            st.write("")
-            st.write("")
-            if st.button("Lưu Vị Thế", use_container_width=True):
-                if price_in > sl_in:
-                    log_trade(sym_in, price_in, qty_in, sl_in, tp_in, reason_in)
-                    st.success(f"Đã lưu lệnh {sym_in}!")
-                    st.rerun()
-                else:
-                    st.error("Giá cắt lỗ phải nhỏ hơn giá vào lệnh!")
-
-    # Truy vấn dữ liệu từ SQLite
-    journal_df = fetch_journal()
-    open_trades = journal_df[journal_df['status'] == 'OPEN'] if not journal_df.empty else pd.DataFrame()
-    closed_trades = journal_df[journal_df['status'] == 'CLOSED'] if not journal_df.empty else pd.DataFrame()
-
-    # Thống kê hiệu suất
-    if not closed_trades.empty:
-        total_closed = len(closed_trades)
-        wins = closed_trades[closed_trades['pnl'] > 0]
-        losses = closed_trades[closed_trades['pnl'] <= 0]
-        win_rate = (len(wins) / total_closed) * 100
-        net_pnl = closed_trades['pnl'].sum()
-
-        s1, s2, s3 = st.columns(3)
-        s1.metric("Tổng Số Lệnh Đã Đóng", f"{total_closed}")
-        s2.metric("Tỷ Lệ Thắng (Win-Rate)", f"{win_rate:.1f}%")
-        s3.metric("Tổng Lãi/Lỗ Thực Tế", f"{net_pnl:,.0f} VNĐ", delta=f"{net_pnl:,.0f}")
-
-    st.markdown("---")
-    st.markdown("#### Các Lệnh Đang Mở (Open Trades)")
-    if not open_trades.empty:
-        st.dataframe(open_trades[['id', 'symbol', 'entry_date', 'entry_price', 'quantity', 'stop_loss', 'target_price', 'reason']], use_container_width=True)
-
-        col_c1, col_c2, col_c3 = st.columns([2, 2, 2])
-        with col_c1:
-            trade_select = st.selectbox("Chọn ID lệnh muốn đóng:", open_trades['id'].tolist())
-        with col_c2:
-            close_price_in = st.number_input("Giá bán đóng lệnh (VNĐ):", value=float(open_trades.loc[open_trades['id'] == trade_select, 'entry_price'].values[0]), step=500.0)
-        with col_c3:
-            st.write("")
-            if st.button("🔒 Đóng Lệnh Ngay", use_container_width=True):
-                close_trade_record(trade_select, close_price_in)
-                st.success(f"Đã chốt lệnh #{trade_select}!")
-                st.rerun()
+            # Vẽ đồ thị nến
+            plot_stock_chart(selected_symbol)
     else:
-        st.info("Hiện không có lệnh nào đang mở.")
-
-    st.markdown("---")
-    st.markdown("#### Lịch Sử Lệnh Đã Đóng (Closed Trades)")
-    if not closed_trades.empty:
-        st.dataframe(closed_trades[['id', 'symbol', 'entry_date', 'entry_price', 'exit_price', 'quantity', 'pnl', 'pnl_pct', 'reason']], use_container_width=True)
-    else:
-        st.caption("Chưa có lịch sử lệnh đã đóng.")
+        st.info("💡 Không có mã cổ phiếu nào đạt trọn vẹn tất cả tiêu chí. Bạn hãy thử nới lỏng thông số ở thanh bên trái (Sidebar).")
+else:
+    st.info("👈 Vui lòng bấm nút **'🚀 BẮT ĐẦU LỌC CỔ PHIẾU'** ở thanh bên trái để quét thị trường.")
