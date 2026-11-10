@@ -1,5 +1,3 @@
-Mã nguồn hoàn chỉnh của ứng dụng:
-
 ```python
 import streamlit as st
 import pandas as pd
