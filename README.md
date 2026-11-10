@@ -1,9 +1,10 @@
-# 📈 Minervini & Livermore Stock Quant Terminal (VN-Stock)
+# 📈 Realtime Vietnam Stock Screener (SEPA & Livermore Pivot)
 
-Hệ thống định lượng & lọc cổ phiếu tự động theo phương pháp **Trend Template (Mark Minervini)** và **Pivot Breakout (Jesse Livermore)** tối ưu cho Thị trường Chứng khoán Việt Nam.
+Ứng dụng web lọc cổ phiếu Việt Nam chuyên nghiệp theo phương pháp **SEPA Trend Template** của phù thủy chứng khoán Mark Minervini và điểm mua **Pocket Pivot** của huyền thoại Jesse Livermore.
 
-## 🚀 Tính năng cốt lõi
-1. **Trend Template Filter**: Quét toàn bộ cổ phiếu thỏa mãn tiêu chí MA50 > MA150 > MA200, độ dốc MA200 và khoảng cách đỉnh/đáy 52 tuần.
-2. **Breakout & Risk Management**: Nhận diện điểm Pivot phá vỡ kèm khối lượng bùng nổ, tự động tính ngưỡng Cắt lỗ (tối đa 6.5%) và Mục tiêu chốt lời (R:R 1:2.5).
-3. **Telegram Real-time Alerts**: Tự động bắn thông báo tức thì khi xuất hiện điểm nổ.
-4. **Trading Journal & Position Sizing**: Quản lý rủi ro trên quy mô vốn (quy tắc 1-2% NAV) và tự động thống kê Win-rate, tỷ lệ R:R thực tế qua SQLite.
+### Tính năng chính:
+- **Trend Template Check**: Tự động nhận diện xu hướng cấp 2 (Stage 2 Uptrend) qua chuỗi MA50 > MA150 > MA200.
+- **Biên độ thu hẹp VCP & Cạn Vol**: Nhận diện vùng cạn kiệt thanh khoản và nén biến động trước khi bứt phá.
+- **Pivot Breakout Alert**: Phát hiện các phiên nổ khối lượng và tăng giá dứt khoát.
+- **Interactive Charts**: Biểu đồ Nến Nhật & Volume chuyên nghiệp tích hợp Plotly.
+- **Dữ liệu thời gian thực**: Kết nối trực tiếp máy chủ chứng khoán TCBS miễn phí.
